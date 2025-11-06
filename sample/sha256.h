@@ -2,6 +2,7 @@
 #define __SHA256_HEADER__
 
 #include <stddef.h>
+#include <cuda_runtime.h>
 
 #ifdef __cplusplus
 extern "C"{
@@ -17,7 +18,10 @@ typedef union _sha256_ctx{
 }SHA256;
 
 //----------- FUNCTION DECLARATION --------
+__host__ __device__
 void sha256_transform(SHA256 *ctx, const BYTE *msg);
+
+__host__ __device__
 void sha256(SHA256 *ctx, const BYTE *msg, size_t len);
 
 

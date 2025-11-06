@@ -14,6 +14,7 @@
 #include <cstring>
 
 #include <cassert>
+#include <cuda_runtime.h>
 
 #include "sha256.h"
 
@@ -52,6 +53,7 @@ unsigned char decode(unsigned char c)
         case '0' ... '9':
             return c-'0';
     }
+    return 0;
 }
 
 
@@ -68,7 +70,7 @@ void convert_string_to_little_endian_bytes(unsigned char* out, char *in, size_t 
     size_t s = 0;
     size_t b = string_len/2-1;
 
-    for(s, b; s < string_len; s+=2, --b)
+    for(; s < string_len; s+=2, --b)
     {
         out[b] = (unsigned char)(decode(in[s])<<4) + decode(in[s+1]);
     }
@@ -93,6 +95,7 @@ void print_hex_inverse(unsigned char* hex, size_t len)
     }
 }
 
+__host__ __device__
 int little_endian_bit_comparison(const unsigned char *a, const unsigned char *b, size_t byte_len)
 {
     // compared from lowest bit
@@ -115,7 +118,7 @@ void getline(char *str, size_t len, FILE *fp)
 }
 
 ////////////////////////   Hash   ///////////////////////
-
+static __host__ __device__
 void double_sha256(SHA256 *sha256_ctx, unsigned char *bytes, size_t len)
 {
     SHA256 tmp;
@@ -180,10 +183,55 @@ void calc_merkle_root(unsigned char *root, int count, char **branch)
     delete[] list;
 }
 
+////////////////////   CUDA Kernel   /////////////////////
+
+// d_block:         指向裝置 (GPU) 記憶體的區塊頭
+// d_target_hex:    指向裝置記憶體的目標困難度
+// d_found_nonce:   指向裝置記憶體的旗標/結果變數。
+//                  初始值為 0xFFFFFFFF，找到解的 thread 會用 atomicExch 寫入 nonce
+// nonce_offset:    這批次 kernel 啟動的 nonce 起始偏移量
+__global__
+void solve_kernel(const HashBlock* d_block, const unsigned char* d_target_hex, unsigned int* d_found_nonce, unsigned long long nonce_offset)
+{
+    // 計算這個 thread 負責的 nonce
+    unsigned long long nonce_ll = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x + nonce_offset;
+    
+    // 檢查是否超出 32-bit (0xFFFFFFFF) 的搜尋範圍
+    if (nonce_ll > 0xFFFFFFFF)
+    {
+        return;
+    }
+    
+    // 檢查是否已經有其他 thread 找到答案
+    if (*d_found_nonce != 0xFFFFFFFF)
+    {
+        return;
+    }
+
+    unsigned int nonce = (unsigned int)nonce_ll;
+
+    // 將區塊頭複製到 thread 自己的 local memory
+    HashBlock local_block = *d_block;
+    local_block.nonce = nonce;
+    
+    SHA256 sha256_ctx;
+    
+    // 執行雙重 SHA256 雜湊
+    double_sha256(&sha256_ctx, (unsigned char*)&local_block, sizeof(local_block));
+    
+    // 比較結果
+    if(little_endian_bit_comparison(sha256_ctx.b, d_target_hex, 32) < 0)  // sha256_ctx < target_hex
+    {
+        // 找到了！ 使用 atomicExch 確保只有一個 thread 能寫入結果
+        // atomicExch 會回傳 d_found_nonce 的 "舊值"
+        // 我們不在乎舊值，我們只想把我們的 nonce 寫上去
+        atomicExch(d_found_nonce, nonce);
+    }
+}
+
 
 void solve(FILE *fin, FILE *fout)
 {
-
     // **** read data *****
     char version[9];
     char prevhash[65];
@@ -266,29 +314,108 @@ void solve(FILE *fin, FILE *fout)
 
 
     // ********** find nonce **************
+
+    HashBlock *d_block;
+    unsigned char *d_target_hex;
+    unsigned int *d_found_nonce;
+    unsigned int h_found_nonce = 0xFFFFFFFF;  // initial value for not found
+
+    cudaMalloc((void**)&d_block, sizeof(HashBlock));
+    cudaMalloc((void**)&d_target_hex, 32 * sizeof(unsigned char));
+    cudaMalloc((void**)&d_found_nonce, sizeof(unsigned int));
+
+    cudaMemcpy(d_block, &block, sizeof(HashBlock), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_target_hex, target_hex, 32 * sizeof(unsigned char), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_found_nonce, &h_found_nonce, sizeof(unsigned int), cudaMemcpyHostToDevice);
+
+    const int BLOCK_SIZE = 256; // 每個 block 256 個 threads
+    const int GRID_SIZE = 1024; // 每個 grid 1024 個 blocks
+    unsigned long long batch_size = (unsigned long long)BLOCK_SIZE * GRID_SIZE;
+    unsigned long long nonce_offset = 0;
+
+    printf("Starting GPU search...\n");
+
+    while (h_found_nonce == 0xFFFFFFFF) {
+        solve_kernel<<<GRID_SIZE, BLOCK_SIZE>>>(d_block, d_target_hex, d_found_nonce, nonce_offset);
+        
+        // 檢查是否有錯誤 (可選，但建議)
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            printf("CUDA kernel launch failed: %s\n", cudaGetErrorString(err));
+            break;
+        }
+
+        // 等待 kernel 完成 (可選，但檢查結果前需要)
+        // cudaDeviceSynchronize(); 
+        // 由於我們馬上要 DtoH 複製，這會隱含同步，所以上面那行可省
+        
+        // 將結果 (是否找到) 從 Device 複製回 Host
+        cudaMemcpy(&h_found_nonce, d_found_nonce, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+
+        // (可選) 印出進度
+        if (h_found_nonce == 0xFFFFFFFF) {
+            printf("Checked nonces up to %llu, no solution found yet.\n", nonce_offset + batch_size - 1);
+        }
+
+        // 檢查是否已搜尋完所有 2^32 個 nonce
+        if (nonce_offset > 0xFFFFFFFF)
+        {
+            printf("Full nonce space searched, no solution found.\n");
+            break;
+        }
+        
+        // 準備下一批次的 nonce 偏移量
+        nonce_offset += batch_size;
+    }
+
+    cudaFree(d_block);
+    cudaFree(d_target_hex);
+    cudaFree(d_found_nonce);
     
     SHA256 sha256_ctx;
     
-    for(block.nonce=0x00000000; block.nonce<=0xffffffff;++block.nonce)
-    {   
-        //sha256d
-        double_sha256(&sha256_ctx, (unsigned char*)&block, sizeof(block));
-        if(block.nonce % 1000000 == 0)
-        {
-            printf("hash #%10u (big): ", block.nonce);
-            print_hex_inverse(sha256_ctx.b, 32);
-            printf("\n");
-        }
+    // for(block.nonce=0x00000000; block.nonce<=0xffffffff;++block.nonce)
+    // {   
+    //     //sha256d
+    //     double_sha256(&sha256_ctx, (unsigned char*)&block, sizeof(block));
+    //     if(block.nonce % 1000000 == 0)
+    //     {
+    //         printf("hash #%10u (big): ", block.nonce);
+    //         print_hex_inverse(sha256_ctx.b, 32);
+    //         printf("\n");
+    //     }
         
-        if(little_endian_bit_comparison(sha256_ctx.b, target_hex, 32) < 0)  // sha256_ctx < target_hex
-        {
-            printf("Found Solution!!\n");
-            printf("hash #%10u (big): ", block.nonce);
-            print_hex_inverse(sha256_ctx.b, 32);
-            printf("\n\n");
+    //     if(little_endian_bit_comparison(sha256_ctx.b, target_hex, 32) < 0)  // sha256_ctx < target_hex
+    //     {
+    //         printf("Found Solution!!\n");
+    //         printf("hash #%10u (big): ", block.nonce);
+    //         print_hex_inverse(sha256_ctx.b, 32);
+    //         printf("\n\n");
 
-            break;
-        }
+    //         break;
+    //     }
+    // }
+
+    if (h_found_nonce != 0xFFFFFFFF)
+    {
+        printf("Found Solution!!\n");
+        
+        // 用找到的 nonce 填入 host 端的 block
+        block.nonce = h_found_nonce;
+        
+        // 在 host 上"再次"計算一次雜湊值，以便印出
+        double_sha256(&sha256_ctx, (unsigned char*)&block, sizeof(block));
+        
+        printf("hash #%10u (big): ", block.nonce);
+        print_hex_inverse(sha256_ctx.b, 32);
+        printf("\n\n");
+    }
+    else
+    {
+        // 迴圈結束了但還是沒找到 (理論上測試案例都會找到)
+        printf("No solution found after searching.\n");
+        // 為了讓程式能繼續，我們隨便設一個值
+        memset(&sha256_ctx, 0, sizeof(sha256_ctx));
     }
     
 
