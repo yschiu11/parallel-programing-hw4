@@ -49,22 +49,29 @@ void sha256_transform(SHA256 *ctx, const BYTE *msg)
 {
 	WORD a, b, c, d, e, f, g, h;
 	WORD i, j;
+
+	WORD w[16];     // <-- 新的 (64 bytes)
 	
-	// Create a 64-entry message schedule array w[0..63] of 32-bit words
-	WORD w[64];
-	// Copy chunk into first 16 words w[0..15] of the message schedule array
 	for(i=0, j=0;i<16;++i, j+=4)
 	{
 		w[i] = (msg[j]<<24) | (msg[j+1]<<16) | (msg[j+2]<<8) | (msg[j+3]);
 	}
 	
-	// Extend the first 16 words into the remaining 48 words w[16..63] of the message schedule array:
-	for(i=16;i<64;++i)
-	{
-		WORD s0 = (_rotr(w[i-15], 7)) ^ (_rotr(w[i-15], 18)) ^ (w[i-15]>>3);
-		WORD s1 = (_rotr(w[i-2], 17)) ^ (_rotr(w[i-2], 19))  ^ (w[i-2]>>10);
-		w[i] = w[i-16] + s0 + w[i-7] + s1;
-	}
+	// // Create a 64-entry message schedule array w[0..63] of 32-bit words
+	// WORD w[64];
+	// // Copy chunk into first 16 words w[0..15] of the message schedule array
+	// for(i=0, j=0;i<16;++i, j+=4)
+	// {
+	// 	w[i] = (msg[j]<<24) | (msg[j+1]<<16) | (msg[j+2]<<8) | (msg[j+3]);
+	// }
+	
+	// // Extend the first 16 words into the remaining 48 words w[16..63] of the message schedule array:
+	// for(i=16;i<64;++i)
+	// {
+	// 	WORD s0 = (_rotr(w[i-15], 7)) ^ (_rotr(w[i-15], 18)) ^ (w[i-15]>>3);
+	// 	WORD s1 = (_rotr(w[i-2], 17)) ^ (_rotr(w[i-2], 19))  ^ (w[i-2]>>10);
+	// 	w[i] = w[i-16] + s0 + w[i-7] + s1;
+	// }
 	
 	
 	// Initialize working variables to current hash value
@@ -80,17 +87,22 @@ void sha256_transform(SHA256 *ctx, const BYTE *msg)
 	// Compress function main loop:
 	for(i=0;i<64;++i)
 	{
+		if (i >= 16)
+        {
+            WORD s0 = (_rotr(w[(i-15)&15], 7)) ^ (_rotr(w[(i-15)&15], 18)) ^ (w[(i-15)&15]>>3);
+		    WORD s1 = (_rotr(w[(i-2)&15], 17)) ^ (_rotr(w[(i-2)&15], 19))  ^ (w[(i-2)&15]>>10);
+		    w[i&15] = w[(i-16)&15] + s0 + w[(i-7)&15] + s1;
+        }
+
 		WORD S0 = (_rotr(a, 2)) ^ (_rotr(a, 13)) ^ (_rotr(a, 22));
 		WORD S1 = (_rotr(e, 6)) ^ (_rotr(e, 11)) ^ (_rotr(e, 25));
 		WORD ch = (e & f) ^ ((~e) & g);
 		WORD maj = (a & b) ^ (a & c) ^ (b & c);
 		// WORD temp1 = h + S1 + ch + k[i] + w[i];
 		#ifdef __CUDA_ARCH__
-			// 這是 Device (GPU) 程式碼，使用 d_k
-			WORD temp1 = h + S1 + ch + d_k[i] + w[i];
+			WORD temp1 = h + S1 + ch + d_k[i] + w[i&15]; // <-- 修改
 		#else
-			// 這是 Host (CPU) 程式碼，使用 k
-			WORD temp1 = h + S1 + ch + k[i] + w[i];
+			WORD temp1 = h + S1 + ch + k[i] + w[i&15];   // <-- 修改
 		#endif
 		WORD temp2 = S0 + maj;
 		

@@ -15,6 +15,7 @@
 
 #include <cassert>
 #include <cuda_runtime.h>
+#include <chrono>
 
 #include "sha256.h"
 
@@ -193,6 +194,17 @@ void calc_merkle_root(unsigned char *root, int count, char **branch)
 __global__
 void solve_kernel(const HashBlock* d_block, const unsigned char* d_target_hex, unsigned int* d_found_nonce, unsigned long long nonce_offset)
 {
+    __shared__ HashBlock s_block;
+    __shared__ unsigned int s_found_nonce;
+
+    if (threadIdx.x == 0)
+    {
+        s_block = *d_block;
+        s_found_nonce = *d_found_nonce;
+    }
+
+    __syncthreads();
+
     // 計算這個 thread 負責的 nonce
     unsigned long long nonce_ll = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x + nonce_offset;
     
@@ -203,7 +215,7 @@ void solve_kernel(const HashBlock* d_block, const unsigned char* d_target_hex, u
     }
     
     // 檢查是否已經有其他 thread 找到答案
-    if (*d_found_nonce != 0xFFFFFFFF)
+    if (s_found_nonce != 0xFFFFFFFF)
     {
         return;
     }
@@ -211,7 +223,7 @@ void solve_kernel(const HashBlock* d_block, const unsigned char* d_target_hex, u
     unsigned int nonce = (unsigned int)nonce_ll;
 
     // 將區塊頭複製到 thread 自己的 local memory
-    HashBlock local_block = *d_block;
+    HashBlock local_block = s_block;
     local_block.nonce = nonce;
     
     SHA256 sha256_ctx;
@@ -328,8 +340,8 @@ void solve(FILE *fin, FILE *fout)
     cudaMemcpy(d_target_hex, target_hex, 32 * sizeof(unsigned char), cudaMemcpyHostToDevice);
     cudaMemcpy(d_found_nonce, &h_found_nonce, sizeof(unsigned int), cudaMemcpyHostToDevice);
 
-    const int BLOCK_SIZE = 256; // 每個 block 256 個 threads
-    const int GRID_SIZE = 1024; // 每個 grid 1024 個 blocks
+    const int BLOCK_SIZE = 128; // 每個 block 128 個 threads
+    const int GRID_SIZE = 2048; // 每個 grid 2048 個 blocks
     unsigned long long batch_size = (unsigned long long)BLOCK_SIZE * GRID_SIZE;
     unsigned long long nonce_offset = 0;
 
@@ -454,11 +466,17 @@ int main(int argc, char **argv)
     fscanf(fin, "%d\n", &totalblock);
     fprintf(fout, "%d\n", totalblock);
 
+    auto start = std::chrono::high_resolution_clock::now();
     for(int i=0;i<totalblock;++i)
     {
         solve(fin, fout);
     }
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+    printf("Elapsed time: %.6f seconds\n", elapsed.count());
 
     return 0;
 }
 
+
+// 11.665703 s
