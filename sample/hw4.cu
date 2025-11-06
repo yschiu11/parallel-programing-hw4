@@ -31,6 +31,16 @@ typedef struct _block
     unsigned int nonce;
 }HashBlock;
 
+// 新增：這個結構體只儲存區塊頭第二個 chunk (64-byte) 中的
+// 固定部分 (merkle root 最後 4 bytes, ntime, nbits)。
+// 總共 4 + 4 + 4 = 12 bytes。
+typedef struct _BlockChunk2Data
+{
+    BYTE merkle_p4[4]; // merkle_root 的 [28..31]
+    unsigned int ntime;
+    unsigned int nbits;
+} BlockChunk2Data;
+
 
 ////////////////////////   Utils   ///////////////////////
 
@@ -186,57 +196,123 @@ void calc_merkle_root(unsigned char *root, int count, char **branch)
 
 ////////////////////   CUDA Kernel   /////////////////////
 
-// d_block:         指向裝置 (GPU) 記憶體的區塊頭
-// d_target_hex:    指向裝置記憶體的目標困難度
-// d_found_nonce:   指向裝置記憶體的旗標/結果變數。
-//                  初始值為 0xFFFFFFFF，找到解的 thread 會用 atomicExch 寫入 nonce
-// nonce_offset:    這批次 kernel 啟動的 nonce 起始偏移量
+// 舊的 Kernel (保留做對比)
 __global__
-void solve_kernel(const HashBlock* d_block, const unsigned char* d_target_hex, unsigned int* d_found_nonce, unsigned long long nonce_offset)
+void solve_kernel_original(const HashBlock* d_block, const unsigned char* d_target_hex, unsigned int* d_found_nonce, unsigned long long nonce_offset)
 {
-    __shared__ HashBlock s_block;
+    // ... (原始程式碼) ...
+}
+
+
+// =================================================================
+//
+//    新：使用 "Mid-state" 優化的 Kernel
+//
+// =================================================================
+__global__
+void solve_kernel_midstate(const SHA256* d_midstate,             // 預先算好的 Mid-state
+                           const BlockChunk2Data* d_chunk2_data, // 第 2 個 chunk 的固定資料
+                           const unsigned char* d_target_hex,    // 目標值
+                           unsigned int* d_found_nonce,          // 找到的 nonce
+                           unsigned long long nonce_offset)     // Nonce 偏移
+{
+    // --- 1. 使用共享記憶體 (優化 #1) ---
+    __shared__ SHA256 s_midstate;
+    __shared__ BlockChunk2Data s_chunk2_data;
     __shared__ unsigned int s_found_nonce;
 
     if (threadIdx.x == 0)
     {
-        s_block = *d_block;
+        s_midstate = *d_midstate;
+        s_chunk2_data = *d_chunk2_data;
         s_found_nonce = *d_found_nonce;
     }
-
     __syncthreads();
 
-    // 計算這個 thread 負責的 nonce
-    unsigned long long nonce_ll = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x + nonce_offset;
-    
-    // 檢查是否超出 32-bit (0xFFFFFFFF) 的搜尋範圍
-    if (nonce_ll > 0xFFFFFFFF)
-    {
-        return;
-    }
-    
-    // 檢查是否已經有其他 thread 找到答案
+    // 檢查是否已有其他 thread 找到答案
     if (s_found_nonce != 0xFFFFFFFF)
     {
         return;
     }
 
+    // --- 2. 計算 Nonce ---
+    unsigned long long nonce_ll = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x + nonce_offset;
+    if (nonce_ll > 0xFFFFFFFF)
+    {
+        return;
+    }
     unsigned int nonce = (unsigned int)nonce_ll;
 
-    // 將區塊頭複製到 thread 自己的 local memory
-    HashBlock local_block = s_block;
-    local_block.nonce = nonce;
+    // --- 3. 執行 SHA-256 (Round 1, 續) ---
+    // (我們跳過了 Transform 1, 直接從 Mid-state 開始)
     
+    // 從共享記憶體載入 Mid-state
+    SHA256 ctx_round1 = s_midstate; 
+    
+    // 準備第 2 個 chunk (data[64...79] + padding)
+    BYTE m[64];
+    memset(m, 0, 64);
+
+    memcpy(m, s_chunk2_data.merkle_p4, 4);  // merkle_root[28..31]
+    memcpy(m + 4, &s_chunk2_data.ntime, 4);   // ntime
+    memcpy(m + 8, &s_chunk2_data.nbits, 4);    // nbits
+    memcpy(m + 12, &nonce, 4);                // nonce (變數!)
+
+    m[16] = 0x80; // 80-byte 訊息的 padding (第 16 byte)
+
+    // 總長度 (80 bytes * 8 bits = 640 bits)
+    // SHA-256 規格要求長度為 64-bit Big Endian
+    unsigned long long L = 640;
+    m[63] = (BYTE)L;
+	m[62] = (BYTE)(L >> 8);
+	m[61] = (BYTE)(L >> 16);
+	m[60] = (BYTE)(L >> 24);
+	m[59] = (BYTE)(L >> 32);
+	m[58] = (BYTE)(L >> 40);
+	m[57] = (BYTE)(L >> 48);
+	m[56] = (BYTE)(L >> 56);
+    
+    // 執行 Round 1 的第 2 次 Transform (Kernel Transform #1)
+    sha256_transform(&ctx_round1, m);
+    sha256_swap_endian(&ctx_round1); // 轉換為 Big Endian (標準 Hash 輸出)
+
+
+    // --- 4. 執行 SHA-256 (Round 2, 全) ---
+    
+    // 這是 Round 2 的最終結果
     SHA256 sha256_ctx;
     
-    // 執行雙重 SHA256 雜湊
-    double_sha256(&sha256_ctx, (unsigned char*)&local_block, sizeof(local_block));
+    // 初始化 Round 2 的 Hash 狀態
+    sha256_ctx.h[0] = 0x6a09e667;
+	sha256_ctx.h[1] = 0xbb67ae85;
+	sha256_ctx.h[2] = 0x3c6ef372;
+	sha256_ctx.h[3] = 0xa54ff53a;
+	sha256_ctx.h[4] = 0x510e527f;
+	sha256_ctx.h[5] = 0x9b05688c;
+	sha256_ctx.h[6] = 0x1f83d9ab;
+	sha256_ctx.h[7] = 0x5be0cd19;
+
+    // 準備第 3 個 chunk (Round 1 的 32-byte 結果 + padding)
+    BYTE m2[64];
+    memset(m2, 0, 64);
+
+    memcpy(m2, ctx_round1.b, 32); // Round 1 的結果
+    m2[32] = 0x80; // 32-byte 訊息的 padding
+
+    // 總長度 (32 bytes * 8 bits = 256 bits)
+    L = 256;
+    m2[63] = (BYTE)L;
+	m2[62] = (BYTE)(L >> 8);
+    // (其他 m2[56..61] 保持為 0)
+
+    // 執行 Round 2 的 Transform (Kernel Transform #2)
+    sha256_transform(&sha256_ctx, m2);
+    sha256_swap_endian(&sha256_ctx); // 轉換為 Big Endian
+
     
-    // 比較結果
+    // --- 5. 比較結果 ---
     if(little_endian_bit_comparison(sha256_ctx.b, d_target_hex, 32) < 0)  // sha256_ctx < target_hex
     {
-        // 找到了！ 使用 atomicExch 確保只有一個 thread 能寫入結果
-        // atomicExch 會回傳 d_found_nonce 的 "舊值"
-        // 我們不在乎舊值，我們只想把我們的 nonce 寫上去
         atomicExch(d_found_nonce, nonce);
     }
 }
@@ -304,7 +380,7 @@ void solve(FILE *fin, FILE *fout)
     
     
     // ********** calculate target value *********
-    // calculate target value from encoded difficulty which is encoded on "nbits"
+    // (這部分不變)
     unsigned int exp = block.nbits >> 24;
     unsigned int mant = block.nbits & 0xffffff;
     unsigned char target_hex[32] = {};
@@ -325,88 +401,94 @@ void solve(FILE *fin, FILE *fout)
     printf("\n");
 
 
-    // ********** find nonce **************
+    // ********** find nonce (Mid-state 優化版) **************
 
-    HashBlock *d_block;
+    // --- 1. (Host) 預先計算 Mid-state ---
+    SHA256 h_midstate;
+    // 初始化
+    h_midstate.h[0] = 0x6a09e667;
+	h_midstate.h[1] = 0xbb67ae85;
+	h_midstate.h[2] = 0x3c6ef372;
+	h_midstate.h[3] = 0xa54ff53a;
+	h_midstate.h[4] = 0x510e527f;
+	h_midstate.h[5] = 0x9b05688c;
+	h_midstate.h[6] = 0x1f83d9ab;
+	h_midstate.h[7] = 0x5be0cd19;
+    
+    // 準備第 1 個 chunk (data[0...63])
+    BYTE chunk1[64];
+    memcpy(chunk1, &block.version, 4);
+    memcpy(chunk1 + 4, block.prevhash, 32);
+    memcpy(chunk1 + 36, block.merkle_root, 28); // 只複製 merkle_root 的前 28 bytes
+
+    // 執行 Transform 1
+    sha256_transform(&h_midstate, chunk1);
+    
+    // --- 2. (Host) 準備第 2 個 chunk 的固定資料 ---
+    BlockChunk2Data h_chunk2_data;
+    memcpy(h_chunk2_data.merkle_p4, block.merkle_root + 28, 4); // 複製 merkle_root 的後 4 bytes
+    h_chunk2_data.ntime = block.ntime;
+    h_chunk2_data.nbits = block.nbits;
+    
+    // --- 3. (Host) 準備 GPU 記憶體 ---
+    // HashBlock *d_block; // 不再需要
+    SHA256 *d_midstate;
+    BlockChunk2Data *d_chunk2_data;
     unsigned char *d_target_hex;
     unsigned int *d_found_nonce;
     unsigned int h_found_nonce = 0xFFFFFFFF;  // initial value for not found
 
-    cudaMalloc((void**)&d_block, sizeof(HashBlock));
+    // cudaMalloc((void**)&d_block, sizeof(HashBlock)); // 不再需要
+    cudaMalloc((void**)&d_midstate, sizeof(SHA256));
+    cudaMalloc((void**)&d_chunk2_data, sizeof(BlockChunk2Data));
     cudaMalloc((void**)&d_target_hex, 32 * sizeof(unsigned char));
     cudaMalloc((void**)&d_found_nonce, sizeof(unsigned int));
 
-    cudaMemcpy(d_block, &block, sizeof(HashBlock), cudaMemcpyHostToDevice);
+    // cudaMemcpy(d_block, &block, sizeof(HashBlock), cudaMemcpyHostToDevice); // 不再需要
+    cudaMemcpy(d_midstate, &h_midstate, sizeof(SHA256), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_chunk2_data, &h_chunk2_data, sizeof(BlockChunk2Data), cudaMemcpyHostToDevice);
     cudaMemcpy(d_target_hex, target_hex, 32 * sizeof(unsigned char), cudaMemcpyHostToDevice);
     cudaMemcpy(d_found_nonce, &h_found_nonce, sizeof(unsigned int), cudaMemcpyHostToDevice);
 
-    const int BLOCK_SIZE = 128; // 每個 block 128 個 threads
-    const int GRID_SIZE = 2048; // 每個 grid 2048 個 blocks
+    const int BLOCK_SIZE = 256; 
+    const int GRID_SIZE = 1024; 
     unsigned long long batch_size = (unsigned long long)BLOCK_SIZE * GRID_SIZE;
     unsigned long long nonce_offset = 0;
 
-    printf("Starting GPU search...\n");
+    printf("Starting GPU search (Mid-state optimized)...\n");
 
     while (h_found_nonce == 0xFFFFFFFF) {
-        solve_kernel<<<GRID_SIZE, BLOCK_SIZE>>>(d_block, d_target_hex, d_found_nonce, nonce_offset);
+        // --- 4. (Host) 啟動新 Kernel ---
+        solve_kernel_midstate<<<GRID_SIZE, BLOCK_SIZE>>>(
+            d_midstate, d_chunk2_data, d_target_hex, d_found_nonce, nonce_offset);
         
-        // 檢查是否有錯誤 (可選，但建議)
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
             printf("CUDA kernel launch failed: %s\n", cudaGetErrorString(err));
             break;
         }
 
-        // 等待 kernel 完成 (可選，但檢查結果前需要)
-        // cudaDeviceSynchronize(); 
-        // 由於我們馬上要 DtoH 複製，這會隱含同步，所以上面那行可省
-        
-        // 將結果 (是否找到) 從 Device 複製回 Host
         cudaMemcpy(&h_found_nonce, d_found_nonce, sizeof(unsigned int), cudaMemcpyDeviceToHost);
 
-        // (可選) 印出進度
-        // if (h_found_nonce == 0xFFFFFFFF) {
-        //     printf("Checked nonces up to %llu, no solution found yet.\n", nonce_offset + batch_size - 1);
-        // }
-
-        // 檢查是否已搜尋完所有 2^32 個 nonce
         if (nonce_offset > 0xFFFFFFFF)
         {
             printf("Full nonce space searched, no solution found.\n");
             break;
         }
         
-        // 準備下一批次的 nonce 偏移量
         nonce_offset += batch_size;
     }
 
-    cudaFree(d_block);
+    // --- 5. (Host) 釋放記憶體 ---
+    // cudaFree(d_block); // 不再需要
+    cudaFree(d_midstate);
+    cudaFree(d_chunk2_data);
     cudaFree(d_target_hex);
     cudaFree(d_found_nonce);
     
     SHA256 sha256_ctx;
     
-    // for(block.nonce=0x00000000; block.nonce<=0xffffffff;++block.nonce)
-    // {   
-    //     //sha256d
-    //     double_sha256(&sha256_ctx, (unsigned char*)&block, sizeof(block));
-    //     if(block.nonce % 1000000 == 0)
-    //     {
-    //         printf("hash #%10u (big): ", block.nonce);
-    //         print_hex_inverse(sha256_ctx.b, 32);
-    //         printf("\n");
-    //     }
-        
-    //     if(little_endian_bit_comparison(sha256_ctx.b, target_hex, 32) < 0)  // sha256_ctx < target_hex
-    //     {
-    //         printf("Found Solution!!\n");
-    //         printf("hash #%10u (big): ", block.nonce);
-    //         print_hex_inverse(sha256_ctx.b, 32);
-    //         printf("\n\n");
-
-    //         break;
-    //     }
-    // }
+    // (CPU 端的舊迴圈已被 GPU 取代)
 
     if (h_found_nonce != 0xFFFFFFFF)
     {
@@ -424,21 +506,15 @@ void solve(FILE *fin, FILE *fout)
     }
     else
     {
-        // 迴圈結束了但還是沒找到 (理論上測試案例都會找到)
         printf("No solution found after searching.\n");
-        // 為了讓程式能繼續，我們隨便設一個值
         memset(&sha256_ctx, 0, sizeof(sha256_ctx));
     }
     
-
-    // print result
-
-    //little-endian
+    // (印出結果部分不變)
     printf("hash(little): ");
     print_hex(sha256_ctx.b, 32);
     printf("\n");
 
-    //big-endian
     printf("hash(big):    ");
     print_hex_inverse(sha256_ctx.b, 32);
     printf("\n\n");
@@ -472,11 +548,8 @@ int main(int argc, char **argv)
         solve(fin, fout);
     }
     auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = end - start;
-    printf("Elapsed time: %.6f seconds\n", elapsed.count());
+    std::chrono::duration<double> duration = end - start;
+    printf("Total time: %.6f seconds\n", duration.count());
 
     return 0;
 }
-
-
-// 11.665703 s
