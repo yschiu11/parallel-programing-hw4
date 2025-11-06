@@ -353,9 +353,9 @@ void solve(FILE *fin, FILE *fout)
         cudaMemcpy(&h_found_nonce, d_found_nonce, sizeof(unsigned int), cudaMemcpyDeviceToHost);
 
         // (可選) 印出進度
-        if (h_found_nonce == 0xFFFFFFFF) {
-            printf("Checked nonces up to %llu, no solution found yet.\n", nonce_offset + batch_size - 1);
-        }
+        // if (h_found_nonce == 0xFFFFFFFF) {
+        //     printf("Checked nonces up to %llu, no solution found yet.\n", nonce_offset + batch_size - 1);
+        // }
 
         // 檢查是否已搜尋完所有 2^32 個 nonce
         if (nonce_offset > 0xFFFFFFFF)
