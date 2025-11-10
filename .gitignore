@@ -1,2 +1,5 @@
 .vscode/**
 outputs/
+sample/hw4
+sample/hw4.o
+sample/sha256.o
