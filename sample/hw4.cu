@@ -16,16 +16,14 @@
 #include <cassert>
 #include <cuda_runtime.h>
 
-// 新增：為了 Host 端的 sleep (polling)
-#include <thread>
+#include <thread>  // for polling sleep
 #include <chrono>
 
 #include "sha256.h"
 
 ////////////////////////   Block   /////////////////////
 
-typedef struct _block
-{
+typedef struct _block {
     unsigned int version;
     unsigned char prevhash[32];
     unsigned char merkle_root[32];
@@ -34,22 +32,23 @@ typedef struct _block
     unsigned int nonce;
 }HashBlock;
 
-typedef struct _BlockChunk2Data
-{
-    BYTE merkle_p4[4]; // merkle_root 的 [28..31]
+typedef struct _BlockChunk2Data {
+    BYTE merkle_p4[4];  // merkle_root [28..31]
     unsigned int ntime;
     unsigned int nbits;
 } BlockChunk2Data;
 
+// read only and cached
+static __constant__ SHA256 SHA256_INITIAL_STATE = {
+    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 
+     0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19}
+};
+
 
 ////////////////////////   Utils   ///////////////////////
 
-// (Utils 函數... decode, convert_string_to_little_endian_bytes, 
-//  print_hex, print_hex_inverse, little_endian_bit_comparison, getline 
-//  ... 均保持不變)
-// ... (為節省篇幅，省略相同的 Utils 函數) ...
-unsigned char decode(unsigned char c){
-    switch(c){
+unsigned char decode(unsigned char c) {
+    switch(c) {
         case 'a': return 0x0a;
         case 'b': return 0x0b;
         case 'c': return 0x0c;
@@ -60,39 +59,37 @@ unsigned char decode(unsigned char c){
     }
     return 0;
 }
-void convert_string_to_little_endian_bytes(unsigned char* out, char *in, size_t string_len){
+void convert_string_to_little_endian_bytes(unsigned char* out, char *in, size_t string_len) {
     assert(string_len % 2 == 0);
     size_t s = 0;
     size_t b = string_len/2-1;
-    for(; s < string_len; s+=2, --b){
+    for (; s < string_len; s+=2, --b)
         out[b] = (unsigned char)(decode(in[s])<<4) + decode(in[s+1]);
-    }
 }
-void print_hex(unsigned char* hex, size_t len){
-    for(int i=0;i<len;++i) printf("%02x", hex[i]);
+void print_hex(unsigned char* hex, size_t len) {
+    for (int i=0; i<len; ++i) printf("%02x", hex[i]);
 }
-void print_hex_inverse(unsigned char* hex, size_t len){
-    for(int i=len-1;i>=0;--i) printf("%02x", hex[i]);
+void print_hex_inverse(unsigned char* hex, size_t len) {
+    for (int i=len-1; i>=0; --i) printf("%02x", hex[i]);
 }
 __host__ __device__
-int little_endian_bit_comparison(const unsigned char *a, const unsigned char *b, size_t byte_len){
-    for(int i=byte_len-1;i>=0;--i){
-        if(a[i] < b[i]) return -1;
-        else if(a[i] > b[i]) return 1;
+int little_endian_bit_comparison(const unsigned char *a, const unsigned char *b, size_t byte_len) {
+    for (int i=byte_len-1; i>=0; --i) {
+        if (a[i] < b[i]) return -1;
+        else if (a[i] > b[i]) return 1;
     }
     return 0;
 }
-void getline(char *str, size_t len, FILE *fp){
+void getline(char *str, size_t len, FILE *fp) {
     int i=0;
-    while( i<len && (str[i] = fgetc(fp)) != EOF && str[i++] != '\n');
+    while ( i<len && (str[i] = fgetc(fp)) != EOF && str[i++] != '\n');
     str[len-1] = '\0';
 }
 
 
 ////////////////////////   Hash   ///////////////////////
 static __host__ __device__
-void double_sha256(SHA256 *sha256_ctx, unsigned char *bytes, size_t len)
-{
+void double_sha256(SHA256 *sha256_ctx, unsigned char *bytes, size_t len) {
     SHA256 tmp;
     sha256(&tmp, (BYTE*)bytes, len);
     sha256(sha256_ctx, (BYTE*)&tmp, sizeof(tmp));
@@ -100,25 +97,23 @@ void double_sha256(SHA256 *sha256_ctx, unsigned char *bytes, size_t len)
 
 
 ////////////////////   Merkle Root   /////////////////////
-// (calc_merkle_root 函數保持不變)
-// ... (為節省篇幅，省略相同的 calc_merkle_root 函數) ...
-void calc_merkle_root(unsigned char *root, int count, char **branch){
+void calc_merkle_root(unsigned char *root, int count, char **branch) {
     size_t total_count = count;
     unsigned char *raw_list = new unsigned char[(total_count+1)*32];
     unsigned char **list = new unsigned char*[total_count+1];
-    for(int i=0;i<total_count; ++i){
+    for (int i=0; i<total_count; ++i) {
         list[i] = raw_list + i * 32;
         convert_string_to_little_endian_bytes(list[i], branch[i], 64);
     }
     list[total_count] = raw_list + total_count*32;
-    while(total_count > 1){
+    while (total_count > 1) {
         int i, j;
-        if(total_count % 2 == 1){
+        if (total_count % 2 == 1)
             memcpy(list[total_count], list[total_count-1], 32);
-        }
-        for(i=0, j=0;i<total_count;i+=2, ++j){
+
+        for (i=0, j=0; i<total_count; i+=2, ++j)
             double_sha256((SHA256*)list[j], list[i], 64);
-        }
+
         total_count = j;
     }
     memcpy(root, list[0], 32);
@@ -129,32 +124,24 @@ void calc_merkle_root(unsigned char *root, int count, char **branch){
 
 ////////////////////   CUDA Kernel   /////////////////////
 
-// =================================================================
-//
-//    新：使用 "Mid-state" + "Grid-Stride Loop" 優化的 Kernel
-//
-// =================================================================
 __global__
-void solve_kernel_midstate(const SHA256* d_midstate,             // pre-calculated Mid-state
-                           const BlockChunk2Data* d_chunk2_data, // 第 2 個 chunk 的固定資料
-                           const unsigned char* d_target_hex,    // 目標值
-                           unsigned int* d_found_nonce)          // 找到的 nonce
-                           // (移除 nonce_offset)
-{
+void solve_kernel_midstate(const SHA256* d_midstate,              // pre-calculated Mid-state
+                           const BlockChunk2Data* d_chunk2_data,  // 第 2 個 chunk 的固定資料
+                           const unsigned char* d_target_hex,     // 目標值
+                           unsigned int* d_found_nonce) {         // 找到的 nonce
     // --- 1. 使用共享記憶體 (優化 #1) ---
     __shared__ SHA256 s_midstate;
     __shared__ BlockChunk2Data s_chunk2_data;
     __shared__ unsigned int s_found_nonce;
 
-    if (threadIdx.x == 0)
-    {
+    if (threadIdx.x == 0) {
         s_midstate = *d_midstate;
         s_chunk2_data = *d_chunk2_data;
         s_found_nonce = *d_found_nonce;
     }
     __syncthreads();
 
-    // --- 2. 計算 Grid-Stride Loop 參數 ---
+    // calculate Grid-Stride loop parameters
     unsigned long long start_nonce = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     unsigned long long grid_stride = (unsigned long long)gridDim.x * blockDim.x;
 
@@ -182,7 +169,7 @@ void solve_kernel_midstate(const SHA256* d_midstate,             // pre-calculat
     // Grid-Stride Loop
     unsigned int i = 0;
     for (unsigned long long nonce_ll = start_nonce; 
-         nonce_ll <= 0xFFFFFFFF; // 搜尋整個 32-bit 空間
+         nonce_ll <= 0xFFFFFFFF;
          nonce_ll += grid_stride, ++i) {
         // check if found before expensive hash
         if ((i & 16384) == 0) {
@@ -206,15 +193,7 @@ void solve_kernel_midstate(const SHA256* d_midstate,             // pre-calculat
         sha256_swap_endian(&ctx_round1); 
 
         // --- 5. 執行 SHA-256 (Round 2, 全) ---
-        SHA256 sha256_ctx;
-        sha256_ctx.h[0] = 0x6a09e667;
-        sha256_ctx.h[1] = 0xbb67ae85;
-        sha256_ctx.h[2] = 0x3c6ef372;
-        sha256_ctx.h[3] = 0xa54ff53a;
-        sha256_ctx.h[4] = 0x510e527f;
-        sha256_ctx.h[5] = 0x9b05688c;
-        sha256_ctx.h[6] = 0x1f83d9ab;
-        sha256_ctx.h[7] = 0x5be0cd19;
+        SHA256 sha256_ctx = SHA256_INITIAL_STATE;
         
         memcpy(m2, ctx_round1.b, 32);  // only write 32 bytes of changeable hash from round 1
         
@@ -223,11 +202,6 @@ void solve_kernel_midstate(const SHA256* d_midstate,             // pre-calculat
 
         if (little_endian_bit_comparison(sha256_ctx.b, d_target_hex, 32) < 0) {
             atomicExch(d_found_nonce, nonce);
-            // 找到後，這個 thread 可以離開，
-            // 其他 thread 會在下一次迴圈的開頭檢查到 d_found_nonce 並離開
-            // if (threadIdx.x == 0) 
-            //     s_found_nonce = nonce;
-        
             return;
         }
     }
@@ -254,7 +228,7 @@ void solve(FILE *fin, FILE *fout)
 
     raw_merkle_branch = new char [tx * 65];
     merkle_branch = new char *[tx];
-    for(int i=0;i<tx;++i){
+    for (int i=0; i<tx; ++i) {
         merkle_branch[i] = raw_merkle_branch + i * 65;
         getline(merkle_branch[i], 65, fin);
         merkle_branch[i][64] = '\0';
@@ -264,9 +238,6 @@ void solve(FILE *fin, FILE *fout)
     printf("merkle root(little): "); print_hex(merkle_root, 32); printf("\n");
     printf("merkle root(big):    "); print_hex_inverse(merkle_root, 32); printf("\n");
 
-
-    // (**** solve block **** 和 (Host) 準備 Mid-state/target... 部分不變)
-    // ... (為節省篇幅，省略相同的 CPU 端準備程式碼) ...
     printf("Block info (big): \n");
     printf("  version:  %s\n", version);
     printf("  pervhash: %s\n", prevhash);
@@ -327,53 +298,39 @@ void solve(FILE *fin, FILE *fout)
     cudaMemcpy(d_target_hex, target_hex, 32 * sizeof(unsigned char), cudaMemcpyHostToDevice);
     cudaMemcpy(d_found_nonce, &h_found_nonce, sizeof(unsigned int), cudaMemcpyHostToDevice);
 
-    // ********** find nonce (Grid-Stride Loop 優化版) **************
-
-    // 啟動參數：
     // BLOCK_SIZE 仍然重要 (256 或 512 是好選擇)
     // GRID_SIZE 現在代表我們要啟動多少 *Block*。
-    // 讓 (GRID_SIZE * BLOCK_SIZE) 遠大於 GPU 核心數，
-    // 以確保 GPU 完全飽和。
+    // let GRID_SIZE * BLOCK_SIZE larger than GPU cores number
+    // to ensure full GPU saturation
     const int BLOCK_SIZE = 256; 
-    const int GRID_SIZE = 1024 * 32; // 啟動 32k 個 blocks
-
-    // (移除 batch_size 和 nonce_offset)
+    const int GRID_SIZE = 1024 * 32; // activate 32k blocks
 
     printf("Starting GPU search (Mid-state + Grid-Stride Loop optimized)...\n");
 
-    // --- 1. (Host) 啟動一次 Kernel ---
-    // (注意：參數移除了 nonce_offset)
+    // --- host activate kernel once---
     solve_kernel_midstate<<<GRID_SIZE, BLOCK_SIZE>>>(
         d_midstate, d_chunk2_data, d_target_hex, d_found_nonce);
     
     cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
+    if (err != cudaSuccess)
         printf("CUDA kernel launch failed: %s\n", cudaGetErrorString(err));
-    }
 
-    // --- 2. (Host) 進入 Polling 迴圈 ---
-    // (這取代了原來的 kernel 啟動迴圈)
-    while (h_found_nonce == 0xFFFFFFFF) 
-    {
-        // 讓 CPU 睡一下，不要 100% 佔用
-        // GPU 會在背景持續工作
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // polling host
+    while (h_found_nonce == 0xFFFFFFFF) {
+        // CPU does run 100%, GPU work in background
+        std::this_thread::sleep_for (std::chrono::milliseconds(100));
         
-        // 偶爾檢查一次 GPU 是否找到了答案
+        // check if found nonce occasionally
         cudaMemcpy(&h_found_nonce, d_found_nonce, sizeof(unsigned int), cudaMemcpyDeviceToHost);
     }
-    // (迴圈結束代表 h_found_nonce != 0xFFFFFFFF, 也就是找到了)
-
 
     cudaFree(d_midstate);
     cudaFree(d_chunk2_data);
     cudaFree(d_target_hex);
     cudaFree(d_found_nonce);
     
-    // (後續的 "Found Solution!!" 印出和驗證部分... 保持不變)
-    // ... (為節省篇幅，省略相同的結果印出程式碼) ...
     SHA256 sha256_ctx;
-    if (h_found_nonce != 0xFFFFFFFF){
+    if (h_found_nonce != 0xFFFFFFFF) {
         printf("Found Solution!!\n");
         block.nonce = h_found_nonce;
         double_sha256(&sha256_ctx, (unsigned char*)&block, sizeof(block));
@@ -387,7 +344,8 @@ void solve(FILE *fin, FILE *fout)
     
     printf("hash(little): "); print_hex(sha256_ctx.b, 32); printf("\n");
     printf("hash(big):    "); print_hex_inverse(sha256_ctx.b, 32); printf("\n\n");
-    for(int i=0;i<4;++i) fprintf(fout, "%02x", ((unsigned char*)&block.nonce)[i]);
+    for (int i=0; i<4; ++i)
+        fprintf(fout, "%02x", ((unsigned char*)&block.nonce)[i]);
     fprintf(fout, "\n");
 
     delete[] merkle_branch;
@@ -396,10 +354,9 @@ void solve(FILE *fin, FILE *fout)
 
 int main(int argc, char **argv)
 {
-    // (main 函數保持不變)
-    if (argc != 3) {
+    if (argc != 3)
         fprintf(stderr, "usage: cuda_miner <in> <out>\n");
-    }
+
     FILE *fin = fopen(argv[1], "r");
     FILE *fout = fopen(argv[2], "w");
 
@@ -408,15 +365,12 @@ int main(int argc, char **argv)
     fprintf(fout, "%d\n", totalblock);
 
     auto start = std::chrono::high_resolution_clock::now();
-    for(int i=0;i<totalblock;++i)
-    {
+    for (int i=0;i<totalblock;++i)
         solve(fin, fout);
-    }
+
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> duration = end - start;
     printf("Total time: %.6f seconds\n", duration.count());
 
     return 0;
 }
-
-// 12.82, 7.048524 6.936092 6.986965

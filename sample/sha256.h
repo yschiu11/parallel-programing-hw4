@@ -27,8 +27,7 @@ typedef union _sha256_ctx{
 static __host__ __device__ inline
 void sha256_swap_endian(SHA256 *ctx)
 {
-	for(int i=0;i<32;i+=4)
-	{
+	for(int i=0; i<32; i+=4) {
         _swap(ctx->b[i], ctx->b[i+3]);
         _swap(ctx->b[i+1], ctx->b[i+2]);
 	}
