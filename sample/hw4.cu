@@ -2,23 +2,19 @@
 // 2018.04.01 created by Zexlus1126
 //
 //    Example 002
-// This is a simple demonstration on calculating merkle root from merkle branch 
-// and solving a block (#286819) which the information is downloaded from Block Explorer 
+// This is a simple demonstration on calculating merkle root from merkle branch
+// and solving a block (#286819) which the information is downloaded from Block Explorer
 //***********************************************************************************
 
 #include <iostream>
 #include <fstream>
 #include <string>
-
 #include <cstdio>
 #include <cstring>
-
 #include <cassert>
 #include <cuda_runtime.h>
-
 #include <thread>  // for polling sleep
 #include <chrono>
-
 #include "sha256.h"
 
 ////////////////////////   Block   /////////////////////
@@ -40,10 +36,9 @@ typedef struct _BlockChunk2Data {
 
 // read only and cached
 static __constant__ SHA256 SHA256_INITIAL_STATE = {
-    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 
+    {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
      0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19}
 };
-
 
 ////////////////////////   Utils   ///////////////////////
 
@@ -86,8 +81,8 @@ void getline(char *str, size_t len, FILE *fp) {
     str[len-1] = '\0';
 }
 
-
 ////////////////////////   Hash   ///////////////////////
+
 static __host__ __device__
 void double_sha256(SHA256 *sha256_ctx, unsigned char *bytes, size_t len) {
     SHA256 tmp;
@@ -95,8 +90,8 @@ void double_sha256(SHA256 *sha256_ctx, unsigned char *bytes, size_t len) {
     sha256(sha256_ctx, (BYTE*)&tmp, sizeof(tmp));
 }
 
-
 ////////////////////   Merkle Root   /////////////////////
+
 void calc_merkle_root(unsigned char *root, int count, char **branch) {
     size_t total_count = count;
     unsigned char *raw_list = new unsigned char[(total_count+1)*32];
@@ -129,7 +124,7 @@ void solve_kernel_midstate(const SHA256* d_midstate,              // pre-calcula
                            const BlockChunk2Data* d_chunk2_data,  // 第 2 個 chunk 的固定資料
                            const unsigned char* d_target_hex,     // 目標值
                            unsigned int* d_found_nonce) {         // 找到的 nonce
-    // --- 1. 使用共享記憶體 (優化 #1) ---
+    // --- 1. use shared memory (optimization #1) ---
     __shared__ SHA256 s_midstate;
     __shared__ BlockChunk2Data s_chunk2_data;
     __shared__ unsigned int s_found_nonce;
@@ -145,6 +140,10 @@ void solve_kernel_midstate(const SHA256* d_midstate,              // pre-calcula
     unsigned long long start_nonce = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     unsigned long long grid_stride = (unsigned long long)gridDim.x * blockDim.x;
 
+    const int STEP = 4;  // each thread calculates 4 nonces continuously
+    unsigned long long base_nonce = start_nonce * STEP;
+    unsigned long long step_stride = grid_stride * STEP;
+
     BYTE m[64];
     BYTE m2[64];
 
@@ -155,8 +154,8 @@ void solve_kernel_midstate(const SHA256* d_midstate,              // pre-calcula
     memcpy(m + 8, &s_chunk2_data.nbits, 4);  // nbits
     m[16] = 0x80;  // padding
     unsigned long long L_640 = 640; // length
-    m[63] = (BYTE)L_640; 
-    m[62] = (BYTE)(L_640 >> 8); 
+    m[63] = (BYTE)L_640;
+    m[62] = (BYTE)(L_640 >> 8);
     m[56] = (BYTE)(L_640 >> 56);
 
     // prefill m2 with fixed data (without hash from round 1)
@@ -168,45 +167,45 @@ void solve_kernel_midstate(const SHA256* d_midstate,              // pre-calcula
 
     // Grid-Stride Loop
     unsigned int i = 0;
-    for (unsigned long long nonce_ll = start_nonce; 
-         nonce_ll <= 0xFFFFFFFF;
-         nonce_ll += grid_stride, ++i) {
-        // check if found before expensive hash
-        if ((i & 16384) == 0) {
-            if (threadIdx.x == 0)
-                s_found_nonce = *d_found_nonce;
+    for (unsigned long long nonce_ll = base_nonce;
+         nonce_ll <= 0xFFFFFFFF - (STEP - 1);
+         nonce_ll += step_stride, ++i) {
 
-            __syncthreads();  // make sure each thread reads updated s_found_nonce
-            
-            if (s_found_nonce != 0xFFFFFFFF)
-                return;  // exit from all threads in the block
-        }
+        for (int s = 0; s < STEP; ++s, ++i) {
+            unsigned int nonce = (unsigned int)(nonce_ll + s);
 
-        unsigned int nonce = (unsigned int)nonce_ll;
+            // --- 4. 執行 SHA-256 (Round 1, 續) ---
+            SHA256 ctx_round1 = s_midstate;
 
-        // --- 4. 執行 SHA-256 (Round 1, 續) ---
-        SHA256 ctx_round1 = s_midstate; 
-         
-        memcpy(m + 12, &nonce, 4);  // only write 4 bytes of changeable nonce        
-        
-        sha256_transform(&ctx_round1, m);
-        sha256_swap_endian(&ctx_round1); 
+            memcpy(m + 12, &nonce, 4);  // only write 4 bytes of changeable nonce
 
-        // --- 5. 執行 SHA-256 (Round 2, 全) ---
-        SHA256 sha256_ctx = SHA256_INITIAL_STATE;
-        
-        memcpy(m2, ctx_round1.b, 32);  // only write 32 bytes of changeable hash from round 1
-        
-        sha256_transform(&sha256_ctx, m2);
-        sha256_swap_endian(&sha256_ctx); 
+            sha256_transform(&ctx_round1, m);
+            sha256_swap_endian(&ctx_round1);
 
-        if (little_endian_bit_comparison(sha256_ctx.b, d_target_hex, 32) < 0) {
-            atomicExch(d_found_nonce, nonce);
-            return;
+            // --- 5. 執行 SHA-256 (Round 2, 全) ---
+            SHA256 sha256_ctx = SHA256_INITIAL_STATE;
+
+            memcpy(m2, ctx_round1.b, 32);  // only write 32 bytes of changeable hash from round 1
+
+            sha256_transform(&sha256_ctx, m2);
+            sha256_swap_endian(&sha256_ctx);
+
+            if (little_endian_bit_comparison(sha256_ctx.b, d_target_hex, 32) < 0) {
+                atomicExch(d_found_nonce, nonce);
+                return;
+            }
+            if ((i & 16384) == 0) {
+                if (threadIdx.x == 0)
+                    s_found_nonce = *d_found_nonce;
+                __syncthreads();
+
+                unsigned int ballot = __ballot_sync(0xFFFFFFFF, (s_found_nonce != 0xFFFFFFFF));
+                if (__any_sync(0xFFFFFFFF, ballot != 0))
+                    return;
+            }
         }
     }
 }
-
 
 void solve(FILE *fin, FILE *fout)
 {
@@ -253,7 +252,7 @@ void solve(FILE *fin, FILE *fout)
     convert_string_to_little_endian_bytes((unsigned char *)&block.nbits,   nbits,     8);
     convert_string_to_little_endian_bytes((unsigned char *)&block.ntime,   ntime,     8);
     block.nonce = 0;
-    
+
     unsigned int exp = block.nbits >> 24;
     unsigned int mant = block.nbits & 0xffffff;
     unsigned char target_hex[32] = {};
@@ -276,12 +275,12 @@ void solve(FILE *fin, FILE *fout)
     memcpy(chunk1 + 4, block.prevhash, 32);
     memcpy(chunk1 + 36, block.merkle_root, 28);
     sha256_transform(&h_midstate, chunk1);
-    
+
     BlockChunk2Data h_chunk2_data;
     memcpy(h_chunk2_data.merkle_p4, block.merkle_root + 28, 4);
     h_chunk2_data.ntime = block.ntime;
     h_chunk2_data.nbits = block.nbits;
-    
+
     SHA256 *d_midstate;
     BlockChunk2Data *d_chunk2_data;
     unsigned char *d_target_hex;
@@ -298,11 +297,9 @@ void solve(FILE *fin, FILE *fout)
     cudaMemcpy(d_target_hex, target_hex, 32 * sizeof(unsigned char), cudaMemcpyHostToDevice);
     cudaMemcpy(d_found_nonce, &h_found_nonce, sizeof(unsigned int), cudaMemcpyHostToDevice);
 
-    // BLOCK_SIZE 仍然重要 (256 或 512 是好選擇)
-    // GRID_SIZE 現在代表我們要啟動多少 *Block*。
     // let GRID_SIZE * BLOCK_SIZE larger than GPU cores number
     // to ensure full GPU saturation
-    const int BLOCK_SIZE = 256; 
+    const int BLOCK_SIZE = 256;
     const int GRID_SIZE = 1024 * 32; // activate 32k blocks
 
     printf("Starting GPU search (Mid-state + Grid-Stride Loop optimized)...\n");
@@ -310,7 +307,7 @@ void solve(FILE *fin, FILE *fout)
     // --- host activate kernel once---
     solve_kernel_midstate<<<GRID_SIZE, BLOCK_SIZE>>>(
         d_midstate, d_chunk2_data, d_target_hex, d_found_nonce);
-    
+
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess)
         printf("CUDA kernel launch failed: %s\n", cudaGetErrorString(err));
@@ -319,7 +316,7 @@ void solve(FILE *fin, FILE *fout)
     while (h_found_nonce == 0xFFFFFFFF) {
         // CPU does run 100%, GPU work in background
         std::this_thread::sleep_for (std::chrono::milliseconds(100));
-        
+
         // check if found nonce occasionally
         cudaMemcpy(&h_found_nonce, d_found_nonce, sizeof(unsigned int), cudaMemcpyDeviceToHost);
     }
@@ -328,7 +325,7 @@ void solve(FILE *fin, FILE *fout)
     cudaFree(d_chunk2_data);
     cudaFree(d_target_hex);
     cudaFree(d_found_nonce);
-    
+
     SHA256 sha256_ctx;
     if (h_found_nonce != 0xFFFFFFFF) {
         printf("Found Solution!!\n");
@@ -341,7 +338,7 @@ void solve(FILE *fin, FILE *fout)
         printf("No solution found after searching.\n");
         memset(&sha256_ctx, 0, sizeof(sha256_ctx));
     }
-    
+
     printf("hash(little): "); print_hex(sha256_ctx.b, 32); printf("\n");
     printf("hash(big):    "); print_hex_inverse(sha256_ctx.b, 32); printf("\n\n");
     for (int i=0; i<4; ++i)
