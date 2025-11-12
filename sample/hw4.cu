@@ -26,7 +26,7 @@ typedef struct _block {
     unsigned int ntime;
     unsigned int nbits;
     unsigned int nonce;
-}HashBlock;
+} HashBlock;
 
 typedef struct _BlockChunk2Data {
     BYTE merkle_p4[4];  // merkle_root [28..31]
@@ -54,6 +54,7 @@ unsigned char decode(unsigned char c) {
     }
     return 0;
 }
+
 void convert_string_to_little_endian_bytes(unsigned char* out, char *in, size_t string_len) {
     assert(string_len % 2 == 0);
     size_t s = 0;
@@ -61,12 +62,15 @@ void convert_string_to_little_endian_bytes(unsigned char* out, char *in, size_t 
     for (; s < string_len; s+=2, --b)
         out[b] = (unsigned char)(decode(in[s])<<4) + decode(in[s+1]);
 }
+
 void print_hex(unsigned char* hex, size_t len) {
     for (int i=0; i<len; ++i) printf("%02x", hex[i]);
 }
+
 void print_hex_inverse(unsigned char* hex, size_t len) {
     for (int i=len-1; i>=0; --i) printf("%02x", hex[i]);
 }
+
 __host__ __device__
 int little_endian_bit_comparison(const unsigned char *a, const unsigned char *b, size_t byte_len) {
     for (int i=byte_len-1; i>=0; --i) {
@@ -75,9 +79,10 @@ int little_endian_bit_comparison(const unsigned char *a, const unsigned char *b,
     }
     return 0;
 }
+
 void getline(char *str, size_t len, FILE *fp) {
     int i=0;
-    while ( i<len && (str[i] = fgetc(fp)) != EOF && str[i++] != '\n');
+    while (i<len && (str[i] = fgetc(fp)) != EOF && str[i++] != '\n');
     str[len-1] = '\0';
 }
 
@@ -116,14 +121,13 @@ void calc_merkle_root(unsigned char *root, int count, char **branch) {
     delete[] list;
 }
 
-
 ////////////////////   CUDA Kernel   /////////////////////
 
 __global__
 void solve_kernel_midstate(const SHA256* d_midstate,              // pre-calculated Mid-state
-                           const BlockChunk2Data* d_chunk2_data,  // 第 2 個 chunk 的固定資料
-                           const unsigned char* d_target_hex,     // 目標值
-                           unsigned int* d_found_nonce) {         // 找到的 nonce
+                           const BlockChunk2Data* d_chunk2_data,  // second chunk fixed data
+                           const unsigned char* d_target_hex,     // target value
+                           unsigned int* d_found_nonce) {         // found nonce
     // --- 1. use shared memory (optimization #1) ---
     __shared__ SHA256 s_midstate;
     __shared__ BlockChunk2Data s_chunk2_data;
@@ -174,7 +178,6 @@ void solve_kernel_midstate(const SHA256* d_midstate,              // pre-calcula
         for (int s = 0; s < STEP; ++s, ++i) {
             unsigned int nonce = (unsigned int)(nonce_ll + s);
 
-            // --- 4. 執行 SHA-256 (Round 1, 續) ---
             SHA256 ctx_round1 = s_midstate;
 
             memcpy(m + 12, &nonce, 4);  // only write 4 bytes of changeable nonce
@@ -182,7 +185,6 @@ void solve_kernel_midstate(const SHA256* d_midstate,              // pre-calcula
             sha256_transform(&ctx_round1, m);
             sha256_swap_endian(&ctx_round1);
 
-            // --- 5. 執行 SHA-256 (Round 2, 全) ---
             SHA256 sha256_ctx = SHA256_INITIAL_STATE;
 
             memcpy(m2, ctx_round1.b, 32);  // only write 32 bytes of changeable hash from round 1
@@ -194,6 +196,7 @@ void solve_kernel_midstate(const SHA256* d_midstate,              // pre-calcula
                 atomicExch(d_found_nonce, nonce);
                 return;
             }
+
             if ((i & 16384) == 0) {
                 if (threadIdx.x == 0)
                     s_found_nonce = *d_found_nonce;
@@ -314,8 +317,7 @@ void solve(FILE *fin, FILE *fout)
 
     // polling host
     while (h_found_nonce == 0xFFFFFFFF) {
-        // CPU does run 100%, GPU work in background
-        std::this_thread::sleep_for (std::chrono::milliseconds(100));
+        std::this_thread::sleep_for (std::chrono::milliseconds(50));
 
         // check if found nonce occasionally
         cudaMemcpy(&h_found_nonce, d_found_nonce, sizeof(unsigned int), cudaMemcpyDeviceToHost);
@@ -362,8 +364,14 @@ int main(int argc, char **argv)
     fprintf(fout, "%d\n", totalblock);
 
     auto start = std::chrono::high_resolution_clock::now();
-    for (int i=0;i<totalblock;++i)
+    auto prev = start;
+    for (int i=0; i<totalblock; ++i) {
         solve(fin, fout);
+        auto now = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> duration = now - prev;
+        prev = now;
+        printf("Block %d solved in %.6f seconds\n\n", i+1, duration.count());
+    }
 
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> duration = end - start;
