@@ -45,34 +45,14 @@ extern "C"{
 #endif  //__cplusplus
 
 __host__ __device__
-void sha256_transform(SHA256 *ctx, const BYTE *msg)
-{
+void sha256_transform(SHA256 *ctx, const BYTE *msg) {
 	WORD a, b, c, d, e, f, g, h;
 	WORD i, j;
 
-	WORD w[16];     // <-- 新的 (64 bytes)
+	WORD w[16];
 	
-	for(i=0, j=0;i<16;++i, j+=4)
-	{
-		w[i] = (msg[j]<<24) | (msg[j+1]<<16) | (msg[j+2]<<8) | (msg[j+3]);
-	}
-	
-	// // Create a 64-entry message schedule array w[0..63] of 32-bit words
-	// WORD w[64];
-	// // Copy chunk into first 16 words w[0..15] of the message schedule array
-	// for(i=0, j=0;i<16;++i, j+=4)
-	// {
-	// 	w[i] = (msg[j]<<24) | (msg[j+1]<<16) | (msg[j+2]<<8) | (msg[j+3]);
-	// }
-	
-	// // Extend the first 16 words into the remaining 48 words w[16..63] of the message schedule array:
-	// for(i=16;i<64;++i)
-	// {
-	// 	WORD s0 = (_rotr(w[i-15], 7)) ^ (_rotr(w[i-15], 18)) ^ (w[i-15]>>3);
-	// 	WORD s1 = (_rotr(w[i-2], 17)) ^ (_rotr(w[i-2], 19))  ^ (w[i-2]>>10);
-	// 	w[i] = w[i-16] + s0 + w[i-7] + s1;
-	// }
-	
+	for (i=0, j=0; i<16; ++i, j+=4)
+		w[i] = (msg[j]<<24) | (msg[j+1]<<16) | (msg[j+2]<<8) | (msg[j+3]);	
 	
 	// Initialize working variables to current hash value
 	a = ctx->h[0];
@@ -85,10 +65,9 @@ void sha256_transform(SHA256 *ctx, const BYTE *msg)
 	h = ctx->h[7];
 	
 	// Compress function main loop:
-	for(i=0;i<64;++i)
-	{
-		if (i >= 16)
-        {
+	#pragma unroll 64
+	for (i=0; i<64; ++i) {
+		if (i >= 16) {
             WORD s0 = (_rotr(w[(i-15)&15], 7)) ^ (_rotr(w[(i-15)&15], 18)) ^ (w[(i-15)&15]>>3);
 		    WORD s1 = (_rotr(w[(i-2)&15], 17)) ^ (_rotr(w[(i-2)&15], 19))  ^ (w[(i-2)&15]>>10);
 		    w[i&15] = w[(i-16)&15] + s0 + w[(i-7)&15] + s1;
@@ -129,8 +108,7 @@ void sha256_transform(SHA256 *ctx, const BYTE *msg)
 }
 
 __host__ __device__
-void sha256(SHA256 *ctx, const BYTE *msg, size_t len)
-{
+void sha256(SHA256 *ctx, const BYTE *msg, size_t len) {
 	// Initialize hash values:
 	// (first 32 bits of the fractional parts of the square roots of the first 8 primes 2..19):
 	ctx->h[0] = 0x6a09e667;
@@ -149,24 +127,19 @@ void sha256(SHA256 *ctx, const BYTE *msg, size_t len)
 	
 	// Process the message in successive 512-bit chunks
 	// For each chunk:
-	for(i=0;i<total_len;i+=64)
-	{
+	for (i=0; i<total_len; i+=64)
 		sha256_transform(ctx, &msg[i]);
-	}
 	
 	// Process remain data
 	BYTE m[64] = {};
-	for(i=total_len, j=0;i<len;++i, ++j)
-	{
+	for (i=total_len, j=0; i<len; ++i, ++j)
 		m[j] = msg[i];
-	}
 	
 	// Append a single '1' bit
 	m[j++] = 0x80;  //1000 0000
 	
 	// Append K '0' bits, where k is the minimum number >= 0 such that L + 1 + K + 64 is a multiple of 512
-	if(j > 56)
-	{
+	if (j > 56) {
 		sha256_transform(ctx, m);
 		memset(m, 0, sizeof(m));
 		// printf("true\n");
@@ -186,8 +159,7 @@ void sha256(SHA256 *ctx, const BYTE *msg, size_t len)
 	
 	// Produce the final hash value (little-endian to big-endian)
 	// Swap 1st & 4th, 2nd & 3rd byte for each word
-	for(i=0;i<32;i+=4)
-	{
+	for (i=0; i<32; i+=4) {
         _swap(ctx->b[i], ctx->b[i+3]);
         _swap(ctx->b[i+1], ctx->b[i+2]);
 	}
@@ -195,7 +167,7 @@ void sha256(SHA256 *ctx, const BYTE *msg, size_t len)
 
 // Unit test
 #ifdef __SHA256_UNITTEST__
-	#define print_hash(x) printf("sha256 hash: "); for(int i=0;i<32;++i)printf("%02X", (x).b[i]);
+	#define print_hash(x) printf("sha256 hash: "); for (int i=0;i<32;++i)printf("%02X", (x).b[i]);
 	#define print_msg(x) printf("%s", ((x) ? "Pass":"Failed"))
 
 int main(int argc, char **argv)
